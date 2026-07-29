@@ -1899,6 +1899,551 @@ def _context_suffix(question: str) -> str:
     return "; ".join(bits)
 
 
+
+# ---------------------------------------------------------------------------
+# Dashboard concept explanations
+# ---------------------------------------------------------------------------
+
+_CONCEPT_ALIASES: dict[str, tuple[str, ...]] = {
+    "scale": (
+        "scale", "export scale", "size of exports", "export size", "commercial footprint",
+    ),
+    "diversification": (
+        "diversification", "diversified", "diversify", "export breadth",
+        "product breadth", "market breadth", "variety of products", "variety of markets",
+    ),
+    "composition": (
+        "composition", "export composition", "export basket", "sector mix",
+        "export structure", "what exports are made of",
+    ),
+    "concentration": (
+        "concentration", "concentrated", "dependence", "reliance on few products",
+        "herfindahl", "hhi",
+    ),
+    "complexity": (
+        "complexity", "economic complexity", "product complexity", "pci",
+        "capability intensive", "knowledge intensive",
+    ),
+    "competitiveness": (
+        "competitiveness", "comparative advantage", "revealed comparative advantage", "rca",
+    ),
+    "sophistication": (
+        "sophistication", "export sophistication", "basket sophistication", "expy",
+    ),
+    "growth": (
+        "growth", "export growth", "growth rate", "cagr", "change over time",
+    ),
+    "reach": (
+        "reach", "market reach", "export reach", "number of markets",
+        "number of destinations",
+    ),
+    "market_size": (
+        "market size", "import market size", "destination demand", "market demand",
+    ),
+    "potential": (
+        "potential", "unrealized potential", "unrealised potential",
+        "untapped potential", "export opportunity",
+    ),
+    "performance": (
+        "performance", "overperforming", "underperforming", "performance status",
+    ),
+    "priority": (
+        "priority", "prioritization", "prioritisation", "priority market",
+        "priority product",
+    ),
+}
+
+_CONCEPT_DETAILS: dict[str, dict[str, str]] = {
+    "scale": {
+        "title": "Scale",
+        "meaning": (
+            "Scale means the current size of an export activity. It answers: how much is Lebanon "
+            "exporting in money terms?"
+        ),
+        "measurement": (
+            "The dashboard measures scale mainly through export value in USD for the selected year. "
+            "Scale can describe total industrial exports, a sector, a product, or exports to one country. "
+            "For the overall trend, the dashboard can show nominal value and a CPI-adjusted real value."
+        ),
+        "interpretation": (
+            "Higher scale means a larger existing commercial footprint. Lower scale means the activity "
+            "is currently smaller."
+        ),
+        "caution": (
+            "Scale does not show whether exports are well diversified, sophisticated, competitive, or "
+            "growing. A large export flow can still depend on one product or one market."
+        ),
+    },
+    "diversification": {
+        "title": "Diversification",
+        "meaning": (
+            "Diversification means how widely exports are spread rather than concentrated in a few places. "
+            "It has two sides: the breadth of products exported and the breadth of destination markets."
+        ),
+        "measurement": (
+            "The dashboard uses active product counts, active destination counts, and market-level product "
+            "concentration. For a destination, a lower HHI means the export basket is distributed more evenly "
+            "across products; a higher HHI means a few products dominate."
+        ),
+        "interpretation": (
+            "Higher diversification generally reduces dependence on one product or market and can make export "
+            "earnings more resilient."
+        ),
+        "caution": (
+            "A larger product count alone is not enough. A market can receive many products but remain highly "
+            "dependent on one dominant product. Diversification also does not automatically mean high value, "
+            "complexity, or profitability."
+        ),
+    },
+    "composition": {
+        "title": "Composition",
+        "meaning": (
+            "Composition describes what the export basket is made of."
+        ),
+        "measurement": (
+            "The dashboard shows the value and share of sectors, products, or markets in total exports."
+        ),
+        "interpretation": (
+            "Composition reveals which activities dominate the export structure and how that structure changes."
+        ),
+        "caution": (
+            "Composition is about shares, not total size. A sector can gain share because it grew, or because "
+            "other sectors declined."
+        ),
+    },
+    "concentration": {
+        "title": "Concentration",
+        "meaning": (
+            "Concentration is the opposite side of diversification. It asks whether exports depend heavily on "
+            "a small number of products or markets."
+        ),
+        "measurement": (
+            "For destination baskets, the dashboard uses HHI, which sums squared product shares. Higher values "
+            "mean stronger concentration; lower values mean a more even product mix."
+        ),
+        "interpretation": (
+            "High concentration can create vulnerability if the dominant product faces a demand, price, or "
+            "market-access shock."
+        ),
+        "caution": (
+            "Concentration is not always bad. A successful specialized niche may be concentrated, so it should "
+            "be read with scale, growth, and market conditions."
+        ),
+    },
+    "complexity": {
+        "title": "Complexity",
+        "meaning": (
+            "Complexity describes how capability-intensive and uncommon a product is in the global productive system."
+        ),
+        "measurement": (
+            "The dashboard uses the Product Complexity Index. Higher PCI values are associated with products that "
+            "typically require broader and less widely available productive capabilities."
+        ),
+        "interpretation": (
+            "Higher complexity can point to deeper capabilities and stronger possibilities for learning and upgrading."
+        ),
+        "caution": (
+            "Complexity describes the product, not whether Lebanon can profitably expand it. It should be read with "
+            "export value, competitiveness, growth, and market reach."
+        ),
+    },
+    "competitiveness": {
+        "title": "Competitiveness",
+        "meaning": (
+            "In this dashboard, competitiveness means whether a product is more important in Lebanon's exports than "
+            "it is in world trade."
+        ),
+        "measurement": (
+            "The dashboard uses Revealed Comparative Advantage. An RCA of 1 is the usual threshold; values above 1 "
+            "indicate revealed specialization."
+        ),
+        "interpretation": (
+            "A value above 1 suggests that Lebanon has an established relative export strength in that product."
+        ),
+        "caution": (
+            "RCA is descriptive. It does not prove profitability, quality, spare capacity, or future demand, and very "
+            "large ratios should be read together with actual export value."
+        ),
+    },
+    "sophistication": {
+        "title": "Export sophistication",
+        "meaning": (
+            "Sophistication summarizes the type of products contained in the basket exported to a destination."
+        ),
+        "measurement": (
+            "The dashboard uses EXPY, a share-weighted basket measure associated with the income or sophistication "
+            "of the exported products."
+        ),
+        "interpretation": (
+            "A higher value indicates that the destination basket is tilted toward products associated with more "
+            "sophisticated export structures."
+        ),
+        "caution": (
+            "It does not measure profit, quality, domestic value added, or the ease of entering that market."
+        ),
+    },
+    "growth": {
+        "title": "Growth",
+        "meaning": (
+            "Growth describes how export value changes over time."
+        ),
+        "measurement": (
+            "The dashboard can show the absolute change, percentage change, annual series, and CAGR. CAGR is the "
+            "constant annual rate that would connect the first and last values."
+        ),
+        "interpretation": (
+            "Positive growth means export value increased over the selected period; negative growth means it declined."
+        ),
+        "caution": (
+            "CAGR smooths the path and can hide volatility. Growth from a very small starting value can also produce "
+            "a large percentage while remaining small in dollars."
+        ),
+    },
+    "reach": {
+        "title": "Market reach",
+        "meaning": (
+            "Reach measures how broadly a product is sold across destination markets."
+        ),
+        "measurement": (
+            "The dashboard counts the number of destination countries receiving the product in the selected year. "
+            "For a destination, the reverse view counts how many Lebanese products it receives."
+        ),
+        "interpretation": (
+            "Broader reach can indicate wider commercial acceptance and less dependence on one destination."
+        ),
+        "caution": (
+            "Reach counts presence, not the size or profitability of sales in each market."
+        ),
+    },
+    "market_size": {
+        "title": "Import market size",
+        "meaning": (
+            "Market size is the destination country's total import demand for a particular product."
+        ),
+        "measurement": (
+            "The dashboard's HS6 market-size table records the country's total imports of that product in USD for "
+            "the available year."
+        ),
+        "interpretation": (
+            "A larger market offers more demand in absolute terms, but Lebanon may still hold a very small share."
+        ),
+        "caution": (
+            "Large demand does not guarantee accessibility. Tariffs, standards, logistics, competition, and buyer "
+            "requirements still matter."
+        ),
+    },
+    "potential": {
+        "title": "Unrealized export potential",
+        "meaning": (
+            "Potential is an estimate of additional product-country trade that could be possible beyond current exports."
+        ),
+        "measurement": (
+            "The dashboard uses positive opportunity values from its uploaded product-destination potential matrix."
+        ),
+        "interpretation": (
+            "A larger value identifies an opportunity worth investigating more closely."
+        ),
+        "caution": (
+            "It is not a forecast or guaranteed sale. It must be checked against capacity, prices, standards, logistics, "
+            "competition, and actual buyer demand."
+        ),
+    },
+    "performance": {
+        "title": "Market performance",
+        "meaning": (
+            "Performance compares observed exports with the dashboard's expected or benchmarked market position."
+        ),
+        "measurement": (
+            "The dashboard classifies markets into performance groups using its combined market indicators."
+        ),
+        "interpretation": (
+            "Overperformance means observed exports are stronger than the benchmark; underperformance means they lag it."
+        ),
+        "caution": (
+            "The label identifies a pattern, not its cause. Explaining the gap requires product-level, price, logistics, "
+            "policy, and capacity evidence."
+        ),
+    },
+    "priority": {
+        "title": "Priority",
+        "meaning": (
+            "Priority is an action-oriented screening label used to focus attention on products or markets."
+        ),
+        "measurement": (
+            "It combines dashboard evidence such as current exports, performance, and opportunity indicators rather "
+            "than representing one standalone measurement."
+        ),
+        "interpretation": (
+            "A priority result means the case deserves further commercial or policy investigation."
+        ),
+        "caution": (
+            "It is a screening device, not an investment recommendation. Final decisions need firm-level costs, capacity, "
+            "standards, competitors, and buyer validation."
+        ),
+    },
+}
+
+
+def _concepts_in_question(question: str) -> list[str]:
+    """Return dashboard concepts in the order they appear in the question."""
+    q = _norm(question)
+    found: list[tuple[int, str]] = []
+    for concept, aliases in _CONCEPT_ALIASES.items():
+        positions = [q.find(alias) for alias in aliases if q.find(alias) >= 0]
+        if positions:
+            found.append((min(positions), concept))
+    found.sort()
+    return [concept for _, concept in found]
+
+
+def _is_concept_explanation_request(question: str) -> bool:
+    """Identify definition, interpretation, and metric-comparison questions."""
+    q = _norm(question)
+    concepts = _concepts_in_question(question)
+    if not concepts:
+        return False
+    explanation_phrases = (
+        "what is", "what are", "what does", "what do", "define", "definition", "meaning",
+        "explain", "tell me about", "help me understand", "how is", "how are", "how do", "how should", "how to read",
+        "interpret", "difference between", "different from", "versus", " vs ",
+        "is higher better", "is lower better", "is higher", "is lower", "is more", "is less",
+        "always better", "better or worse", "good or bad", "why does", "why is", "why are",
+    )
+    if any(phrase in q for phrase in explanation_phrases):
+        return True
+    # Short metric-only prompts are almost always requests for explanation.
+    non_concept_tokens = [
+        token for token in re.findall(r"[a-z]+", q)
+        if token not in {
+            "and", "or", "with", "the", "a", "an", "of", "in", "for", "to",
+            "dashboard", "metric", "metrics", "indicator", "indicators",
+        }
+        and not any(token in alias.split() for aliases in _CONCEPT_ALIASES.values() for alias in aliases)
+    ]
+    return len(q.split()) <= 6 and len(non_concept_tokens) <= 1
+
+
+def _concept_snapshot(question: str, concepts: list[str]) -> str:
+    """Add exact latest-year figures only when the question names an entity or Lebanon."""
+    year_values = _years(question)
+    year = year_values[-1] if year_values else 2025
+    market = _find_market(question)
+    sector = _find_sector(question)
+    product, product_score = _find_product(question)
+    idx = indices()
+    concept_set = set(concepts)
+
+    lines: list[str] = []
+    if market:
+        country = str(market.get("country"))
+        lines.append(f"**Dashboard example - {country}, {year}**")
+        if "scale" in concept_set:
+            lines.append(f"- Scale: Lebanon exported {_money(_value_of(market, year, 'exports'))} to {country}.")
+        if "diversification" in concept_set:
+            lines.append(f"- Product breadth: {int(market.get(f'products_{year}') or market.get('n_products_hs6') or 0):,} products.")
+            lines.append(f"- Product balance: HHI {_number(market.get('hhi'), 3)}. Lower values indicate a more even basket.")
+        elif "concentration" in concept_set:
+            lines.append(f"- Product concentration: HHI {_number(market.get('hhi'), 3)}.")
+        if "sophistication" in concept_set:
+            lines.append(f"- Export sophistication: EXPY {_number(market.get('expy_2025'), 0)}.")
+        if "growth" in concept_set:
+            lines.append(f"- Growth: {_pct(market.get('cagr'))} CAGR over the dashboard period.")
+        return "\n".join(lines) if len(lines) > 1 else ""
+
+    if sector:
+        sector_name = str(sector.get("sector"))
+        active_products = [
+            row for row in idx["products"]
+            if row.get("sector") == sector_name and _value_of(row, year) > 0
+        ]
+        product_hs = {_hs6(row.get("hs6")) for row in active_products}
+        markets = {
+            country for (hs6, country, row_year), value in idx["product_market"].items()
+            if row_year == year and value > 0 and hs6 in product_hs
+        }
+        lines.append(f"**Dashboard example - {sector_name}, {year}**")
+        if "scale" in concept_set:
+            lines.append(f"- Scale: {_money(_value_of(sector, year))}.")
+        if "diversification" in concept_set:
+            lines.append(f"- Product breadth: {len(active_products):,} active products.")
+            lines.append(f"- Market breadth: {len(markets):,} active destinations.")
+        if "complexity" in concept_set:
+            lines.append(f"- Export-weighted complexity: PCI {_number(sector.get('pci_avg'))}.")
+        if "competitiveness" in concept_set:
+            lines.append(f"- Sector competitiveness: RCA {_number(sector.get(f'rca_{year}') or sector.get('rca'))}.")
+        return "\n".join(lines) if len(lines) > 1 else ""
+
+    if product and product_score >= 0.90:
+        name = str(product.get("name"))
+        reach = int((product.get("n_countries_by_year") or {}).get(str(year)) or product.get("n_countries") or 0)
+        lines.append(f"**Dashboard example - {name}, {year}**")
+        if "scale" in concept_set:
+            lines.append(f"- Scale: {_money(_value_of(product, year))}.")
+        if "reach" in concept_set or "diversification" in concept_set:
+            lines.append(f"- Market reach: {reach:,} destinations.")
+        if "complexity" in concept_set:
+            lines.append(f"- Product complexity: PCI {_number(product.get('pci'))}.")
+        if "competitiveness" in concept_set:
+            lines.append(f"- Competitiveness: RCA {_number(product.get(f'rca_{year}'))}.")
+        if "growth" in concept_set:
+            lines.append(f"- Growth: {_pct(product.get('cagr'))} CAGR over the dashboard period.")
+        return "\n".join(lines) if len(lines) > 1 else ""
+
+    q = _norm(question)
+    if "lebanon" in q or "overall" in q or "dashboard" in q:
+        totals = {int(row.get("year")): row for row in bundle().get("totals_by_year", [])}
+        total_row = totals.get(year) or totals[max(totals)]
+        active_products = [row for row in idx["products"] if _value_of(row, year) > 0]
+        active_markets = [row for row in idx["markets"] if _value_of(row, year, "exports") > 0]
+        lines.append(f"**Dashboard example - Lebanon, {year}**")
+        if "scale" in concept_set:
+            lines.append(f"- Scale: {_money(float(total_row.get('filtered') or 0))} in nominal industrial exports.")
+        if "diversification" in concept_set:
+            lines.append(f"- Product breadth: {len(active_products):,} active products.")
+            lines.append(f"- Market breadth: {len(active_markets):,} active destinations.")
+        return "\n".join(lines) if len(lines) > 1 else ""
+
+    return ""
+
+def _dashboard_concept_answer(question: str) -> DashboardAnswer | None:
+    """Explain one or more dashboard concepts in plain, decision-useful language."""
+    if not _is_concept_explanation_request(question):
+        return None
+    concepts = _concepts_in_question(question)
+    if not concepts:
+        return None
+
+    # A named entity plus a metric commonly means "give me the value", not
+    # "define the metric". Preserve explanation routing only when the wording
+    # explicitly asks for meaning, interpretation, or methodology.
+    q = _norm(question)
+    market = _find_market(question)
+    sector = _find_sector(question)
+    product, product_score = _find_product(question)
+    has_entity = bool(market or sector or (product is not None and product_score >= 0.90))
+    strong_explanation = any(phrase in q for phrase in (
+        "what does", "what do", "mean", "meaning", "define", "definition",
+        "explain", "tell me about", "help me understand", "how is it measured",
+        "how is this measured", "how are they measured", "how to read",
+        "interpret", "difference between", "different from", "is higher",
+        "is lower", "is more", "is less", "always better", "good or bad",
+        "why is", "why are", "why does",
+    ))
+    entity_value_concepts = {
+        "complexity", "competitiveness", "sophistication", "concentration",
+        "growth", "reach", "market_size", "potential", "performance", "priority",
+    }
+    technical_value_terms = (
+        "rca", "pci", "hhi", "expy", "cagr", "market size",
+        "unrealized potential", "unrealised potential", "export potential",
+    )
+    metric_value_syntax = (
+        any(term in q for term in technical_value_terms)
+        and (
+            re.search(r"\b(of|for|in|to|from)\b", q) is not None
+            or "'s " in q
+            or len(q.split()) > 5
+        )
+    )
+    if (
+        (has_entity and set(concepts) & entity_value_concepts and not strong_explanation)
+        or (metric_value_syntax and not strong_explanation)
+    ):
+        return None
+
+    lines: list[str] = []
+    if len(concepts) == 1:
+        title = _CONCEPT_DETAILS[concepts[0]]["title"]
+        lines.append(f"### What {title.lower()} means in this dashboard")
+    else:
+        labels = [_CONCEPT_DETAILS[concept]["title"] for concept in concepts]
+        lines.append("### " + " and ".join(labels))
+
+    for number, concept in enumerate(concepts, 1):
+        detail = _CONCEPT_DETAILS[concept]
+        if len(concepts) > 1:
+            lines.extend(["", f"{number}. **{detail['title']}**"])
+        else:
+            lines.extend(["", f"**Plain meaning**"])
+        lines.extend([
+            f"- {detail['meaning']}",
+            f"- **How it is measured:** {detail['measurement']}",
+            f"- **How to read it:** {detail['interpretation']}",
+            f"- **Important limit:** {detail['caution']}",
+        ])
+
+    if len(concepts) > 1:
+        lines.extend(["", "**How the concepts differ**"])
+        concept_set = set(concepts)
+        if {"scale", "diversification"}.issubset(concept_set):
+            lines.extend([
+                "- Scale asks how large exports are. Diversification asks how widely they are spread.",
+                "- A country can have high export scale but low diversification if one product dominates.",
+                "- It can also have lower scale but higher diversification if exports are distributed across many products and markets.",
+                "- Neither is automatically better on its own. A strong position combines sufficient scale with limited dependence on a narrow basket.",
+            ])
+        if {"composition", "diversification"}.issubset(concept_set):
+            lines.append("- Composition identifies the basket's shares; diversification assesses how broad and balanced that basket is.")
+        if {"complexity", "competitiveness"}.issubset(concept_set):
+            lines.append("- Complexity describes the capabilities associated with a product; competitiveness describes Lebanon's relative export specialization in it.")
+        if {"growth", "scale"}.issubset(concept_set):
+            lines.append("- Scale is the current level; growth is the change in that level over time.")
+        if {"diversification", "concentration"}.issubset(concept_set):
+            lines.append("- Diversification and concentration describe the same distribution from opposite directions.")
+
+    q = _norm(question)
+    if any(phrase in q for phrase in ("is higher", "is lower", "always better", "better or worse", "good or bad")):
+        lines.extend(["", "**Direct answer**"])
+        for concept in concepts:
+            if concept == "diversification":
+                lines.append("- Not always. Broader and more balanced exports usually reduce dependence, but the quality, value, profitability, and durability of those exports still matter.")
+            elif concept == "scale":
+                lines.append("- Not always. Higher scale is commercially important, but a large flow can remain vulnerable if it is concentrated, declining, or based on thin margins.")
+            elif concept == "concentration":
+                lines.append("- Lower concentration often reduces risk, but specialization can still be rational when Lebanon has a strong and durable niche.")
+            elif concept == "complexity":
+                lines.append("- Not automatically. Higher-complexity products can support upgrading, but only when firms have the capacity, quality, costs, and demand needed to compete.")
+            elif concept == "competitiveness":
+                lines.append("- Not automatically. A higher RCA signals specialization, but it should be checked against actual export value, growth, profitability, and market demand.")
+            elif concept == "growth":
+                lines.append("- Not automatically. Fast percentage growth from a tiny base may still represent little export value, while stable large exports can remain commercially important.")
+            elif concept == "potential":
+                lines.append("- Not automatically. A larger potential estimate is a screening signal, not a guarantee that the opportunity is feasible or profitable.")
+            else:
+                title = _CONCEPT_DETAILS[concept]["title"].lower()
+                lines.append(f"- A higher {title} value is not automatically better. It must be interpreted with the other dashboard dimensions and commercial evidence.")
+
+    snapshot = _concept_snapshot(question, concepts)
+    if snapshot:
+        lines.extend(["", snapshot])
+
+    answer = "\n".join(lines)
+    entities: dict[str, Any] = {
+        "metric": "concept_explanation",
+        "concepts": concepts,
+    }
+    years = _years(question)
+    if years:
+        entities["year"] = years[-1]
+    market = _find_market(question)
+    sector = _find_sector(question)
+    product, product_score = _find_product(question)
+    if market:
+        entities["market"] = market.get("country")
+    if sector:
+        entities["sector"] = sector.get("sector")
+    if product and product_score >= 0.90:
+        entities["hs6"] = _hs6(product.get("hs6"))
+
+    return DashboardAnswer(
+        True,
+        1.0,
+        answer,
+        json.dumps({"concepts": concepts, "snapshot": snapshot}, ensure_ascii=False),
+        entities,
+    )
+
+
 def query_dashboard(question: str) -> DashboardAnswer:
     """Answer dashboard questions with advanced planning and deterministic grounding.
 
@@ -1914,6 +2459,7 @@ def query_dashboard(question: str) -> DashboardAnswer:
 
     # Advanced exact calculations take precedence.
     for resolver in (
+        _dashboard_concept_answer,
         _methodology_answer,
         _strategy_screen_answer,
         _metric_definition_answer,

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from agents.llm_clients import chat_completion
-from tools.dashboard_data import DashboardAnswer
+from tools.dashboard_data import DashboardAnswer, query_dashboard
 
 ROOT = Path(__file__).resolve().parents[1]
 DB_GZIP_PATH = ROOT / "data" / "dashboard_data.sqlite.gz"
@@ -70,7 +70,10 @@ Definitions:
 - RCA >= 1 means revealed comparative advantage.
 - PCI is product complexity; sector PCI is export-weighted average PCI.
 - EXPY is sophistication of the basket exported to a destination.
+- Scale is current export value in USD; it is not growth, diversity, or complexity.
+- Diversification has breadth and balance dimensions: product counts and market counts show breadth, while lower HHI shows a more even destination basket.
 - HHI is concentration; lower HHI means more diversification.
+- Composition means the shares of products, sectors, or markets in total exports.
 - Product-market exports must come from product_market_year/product_market_share.
 - Product names are the primary identifier; show HS codes only if explicitly requested.
 """.strip()
@@ -108,7 +111,7 @@ MARKET_ALIASES = {
     "america": "United States", "usa": "United States", "u s a": "United States", "us": "United States",
     "uk": "United Kingdom", "u k": "United Kingdom", "britain": "United Kingdom",
     "cote d ivoire": "Ivory Coast", "côte d ivoire": "Ivory Coast",
-    "korea": "South Korea", "south korea": "South Korea",
+    "korea": "South Korea", "south korea": "South Korea", "egyptian": "Egypt",
     "russia": "Russian Federation", "uae": "UAE",
 }
 
@@ -134,9 +137,9 @@ SECTOR_ALIASES = {
 PRODUCT_ALIASES = {
     "olive oil": "150910", "virgin olive oil": "150910", "olives oil": "150910",
     "jewelry": "711319", "jewellery": "711319", "gold jewelry": "711319",
-    "phosphoric acid": "280920", "sparkling wine": "220410", "wine": "220410",
+    "phosphoric acid": "280920",
     "chocolate": "180690", "medicine": "300490", "medicines": "300490",
-    "pharmaceutical product": "300490", "perfume": "330300", "soap": "340111",
+    "pharmaceutical product": "300490",
     "wooden furniture": "940360", "printed books": "490199", "books and brochures": "490199",
     "children books": "490300", "children s books": "490300", "concrete mixers": "847431",
     "mortar mixers": "847431", "concrete mixer lorries": "870540", "concrete mixer trucks": "870540",
@@ -271,7 +274,7 @@ def _similar_market_answer(market: str, limit: int) -> str | None:
         lines = [f"**Markets similar to {market}**", ""]
         for idx, row in enumerate(rows, 1):
             lines.append(
-                f"{idx}. **{row.get('country', 'Unknown')}** — Similarity score: {float(row.get('score') or 0):.3f}; "
+                f"{idx}. **{row.get('country', 'Unknown')}** - Similarity score: {float(row.get('score') or 0):.3f}; "
                 f"Continent: {row.get('continent', 'No data')}; 2025 exports: {_money(row.get('exports_2025'))}"
             )
         return "\n".join(lines)
@@ -309,14 +312,32 @@ def _find_products(question: str, limit: int = 8) -> list[ProductMatch]:
     q = _norm_text(question)
     matches: list[ProductMatch] = []
 
-    # Explicit HS4/HS6 references.
+    # Explicit HS references have the highest priority, but numbers embedded
+    # inside official product descriptions (for example "heading no. 1509")
+    # are not treated as user-supplied codes.
+    code_cue = bool(
+        re.search(
+            r"\b(?:hs|hs4|hs6|h s|harmonized|harmonised|tariff|customs|product code|code)\b",
+            q,
+        )
+    )
+    query_words = q.split()
+    numeric_tokens: list[str] = []
     for token in re.findall(r"\b\d{4,6}\b", question):
-        if token in {str(y) for y in range(2018, 2026)}:
+        if token in {str(year) for year in range(2018, 2026)}:
             continue
+        if len(token) == 6 or code_cue or len(query_words) <= 4:
+            numeric_tokens.append(token)
+
+    for token in numeric_tokens:
         code = token.zfill(6)
         exact = catalog["product_by_hs"].get(code)
         if exact:
             matches.append(ProductMatch(code, str(exact["name"]), str(exact["sector"]), 1.0))
+            continue
+        # Four-digit prefixes are accepted only when the question clearly asks
+        # about an HS/product code.
+        if len(token) == 4 and not code_cue and len(query_words) > 4:
             continue
         prefix = token
         for product in catalog["products"]:
@@ -325,13 +346,6 @@ def _find_products(question: str, limit: int = 8) -> list[ProductMatch]:
                 matches.append(ProductMatch(hs6, str(product["name"]), str(product["sector"]), 0.94))
                 if len(matches) >= limit:
                     break
-
-    # Curated ordinary-language aliases.
-    for alias, hs6 in sorted(PRODUCT_ALIASES.items(), key=lambda x: len(x[0]), reverse=True):
-        if _phrase_present(q, alias):
-            product = catalog["product_by_hs"].get(hs6)
-            if product:
-                matches.append(ProductMatch(hs6, str(product["name"]), str(product["sector"]), 0.99))
 
     if matches:
         unique: list[ProductMatch] = []
@@ -342,24 +356,55 @@ def _find_products(question: str, limit: int = 8) -> list[ProductMatch]:
                 seen.add(match.hs6)
         return unique[:limit]
 
-    # Exact name containment in either direction.
+    # A complete dashboard product name must win over any shorter alias that it
+    # happens to contain. This guarantees that all 882 exact names resolve to
+    # their own record rather than to a broader product category.
     exact_candidates: list[tuple[int, int, ProductMatch]] = []
     for product in catalog["products"]:
         name_norm = _norm_text(product["name"])
         position = q.find(name_norm) if name_norm else -1
         if len(name_norm) >= 5 and position >= 0:
-            exact_candidates.append((position, -len(name_norm), ProductMatch(str(product["hs6"]).zfill(6), str(product["name"]), str(product["sector"]), 0.995)))
+            exact_candidates.append(
+                (
+                    position,
+                    -len(name_norm),
+                    ProductMatch(
+                        str(product["hs6"]).zfill(6),
+                        str(product["name"]),
+                        str(product["sector"]),
+                        1.0,
+                    ),
+                )
+            )
     if exact_candidates:
         exact_candidates.sort()
         allow_multiple = bool(re.search(r"\b(?:compare|versus|vs|both)\b", q))
         ordered = [item[2] for item in exact_candidates]
         if not allow_multiple:
-            return [min(ordered, key=lambda m: -len(_norm_text(m.name)))]
+            return [min(ordered, key=lambda match: -len(_norm_text(match.name)))]
         unique: list[ProductMatch] = []
         seen: set[str] = set()
         for item in ordered:
             if item.hs6 not in seen:
-                unique.append(item); seen.add(item.hs6)
+                unique.append(item)
+                seen.add(item.hs6)
+        return unique[:limit]
+
+    # Curated ordinary-language aliases are used only after exact names.
+    for alias, hs6 in sorted(PRODUCT_ALIASES.items(), key=lambda item: len(item[0]), reverse=True):
+        if not _phrase_present(q, alias):
+            continue
+        product = catalog["product_by_hs"].get(hs6)
+        if product:
+            matches.append(ProductMatch(hs6, str(product["name"]), str(product["sector"]), 0.99))
+
+    if matches:
+        unique = []
+        seen = set()
+        for match in matches:
+            if match.hs6 not in seen:
+                unique.append(match)
+                seen.add(match.hs6)
         return unique[:limit]
 
     # Token-indexed fuzzy search across all 882 product names. Remove dimensions,
@@ -380,9 +425,23 @@ def _find_products(question: str, limit: int = 8) -> list[ProductMatch]:
 
     phrase = " ".join(tokens)
     scored: list[tuple[float, int]] = []
+    incidental_single_token_patterns = (
+        "other than {token}",
+        "excluding {token}",
+        "containing {token}",
+        "manufacture of {token}",
+        "used in the manufacture of {token}",
+        "for {token}",
+    )
     for idx in candidate_ids:
         product = catalog["products"][idx]
         name_norm = _norm_text(product["name"])
+        if len(query_set) == 1:
+            token = next(iter(query_set))
+            # Do not substitute a product that only mentions the requested word
+            # as an exclusion, ingredient, end use, or manufacturing application.
+            if any(pattern.format(token=token) in name_norm for pattern in incidental_single_token_patterns):
+                continue
         name_tokens = {_term_root(t) for t in name_norm.split() if len(t) > 2}
         overlap = query_set & name_tokens
         if not overlap:
@@ -402,7 +461,7 @@ def _find_products(question: str, limit: int = 8) -> list[ProductMatch]:
     if not scored:
         return []
     best = scored[0][0]
-    threshold = 0.69 if len(query_set) == 1 else 0.72
+    threshold = 0.86 if len(query_set) == 1 else 0.74
     result: list[ProductMatch] = []
     allow_multiple = bool(re.search(r"\b(?:compare|versus|vs|both)\b", q))
     for score, idx in scored:
@@ -472,11 +531,11 @@ def _parse_measures(q: str) -> set[str]:
         measures.add("n_markets")
     if any(term in q for term in ("status", "priority", "overperform", "underperform", "performance")):
         measures.add("performance")
-    if any(term in q for term in ("new products", "entered products", "products entered", "product entry", "newly exported", "entering exports")):
+    if any(term in q for term in ("new products", "entered products", "products entered", "product entry", "newly exported", "entering exports", "newly entered", "entered the market", "new to the market")):
         measures.add("entry")
     if any(term in q for term in ("exited products", "products exited", "products exiting", "lost products", "product exit", "discontinued", "leaving exports", "no longer exported")):
         measures.add("exit")
-    if any(term in q for term in ("similar market", "similar countries", "comparable market")):
+    if any(term in q for term in ("similar market", "similar markets", "similar country", "similar countries", "comparable market")) or re.search(r"\bmarkets?\b.{0,30}\bsimilar\b|\bsimilar\b.{0,30}\bmarkets?\b", q):
         measures.add("similarity")
     if not measures:
         measures.add("exports")
@@ -520,7 +579,7 @@ def _parse_operation(q: str, years: list[int]) -> tuple[str, bool]:
         return "correlation", ascending
     if re.search(r"\b(?:compare|comparison|versus|\bvs\b|difference between)\b", q):
         return "compare", ascending
-    if re.search(r"\b(?:what drove|drivers|contributed to|contribution to|biggest increase|biggest decline)\b", q):
+    if re.search(r"\b(?:what drove|drove|driving|drivers|contributed to|contribution to|biggest increase|biggest decline)\b", q):
         return "drivers", ascending
     if re.search(r"\b(?:trend|history|over time|year by year|annual series|every year|evolution)\b", q) or len(years) >= 2:
         return "trend", ascending
@@ -562,7 +621,168 @@ def _parse_numeric_filters(question: str) -> list[tuple[str, str, float]]:
                 operator, value = "<", float(match.group(1))
             filters.append((column, operator, value))
             break
+    # Natural count thresholds, such as "countries receiving more than
+    # 500 products" or "markets with at least 300 products".
+    count_patterns = [
+        (r"\b(?:more than|over|above|greater than)\s+(\d+(?:\.\d+)?)\s+(?:(?:distinct|different|lebanese|exported|industrial)\s+)*products\b", "n_products", ">"),
+        (r"\b(?:at least|no fewer than)\s+(\d+(?:\.\d+)?)\s+(?:(?:distinct|different|lebanese|exported|industrial)\s+)*products\b", "n_products", ">="),
+        (r"\b(?:fewer than|less than|under|below)\s+(\d+(?:\.\d+)?)\s+(?:(?:distinct|different|lebanese|exported|industrial)\s+)*products\b", "n_products", "<"),
+        (r"\b(?:at most|no more than)\s+(\d+(?:\.\d+)?)\s+(?:(?:distinct|different|lebanese|exported|industrial)\s+)*products\b", "n_products", "<="),
+        (r"\b(?:more than|over|above|greater than)\s+(\d+(?:\.\d+)?)\s+(?:countries|markets|destinations)\b", "n_markets", ">"),
+        (r"\b(?:at least|no fewer than)\s+(\d+(?:\.\d+)?)\s+(?:countries|markets|destinations)\b", "n_markets", ">="),
+        (r"\b(?:fewer than|less than|under|below)\s+(\d+(?:\.\d+)?)\s+(?:countries|markets|destinations)\b", "n_markets", "<"),
+        (r"\b(?:at most|no more than)\s+(\d+(?:\.\d+)?)\s+(?:countries|markets|destinations)\b", "n_markets", "<="),
+    ]
+    for pattern, column, operator in count_patterns:
+        match = re.search(pattern, q)
+        if match and not any(existing[0] == column for existing in filters):
+            filters.append((column, operator, float(match.group(1))))
+
     return filters
+
+
+
+def _asks_for_products_in_market(q: str) -> bool:
+    """Detect natural questions asking what Lebanon sells to a named market.
+
+    These should return the product basket inside that market, not the market's
+    overall rank. Explicit requests for the total/value remain market-profile
+    questions.
+    """
+    q = _norm_text(q)
+    if re.search(r"\b(?:how much|how many dollars|total|overall|value|amount|worth)\b", q):
+        return False
+    patterns = (
+        r"\bwhat\s+(?:does|do|did)\s+lebanon\s+(?:export|sell|ship)\s+to\b",
+        r"\bwhat\s+(?:does|do|did)\s+[^?]+\s+(?:import|buy|purchase)\s+from\s+lebanon\b",
+        r"\b(?:what|which)\s+(?:products|goods|items|commodities)\b.*\b(?:export|sell|ship|send|go)\b",
+        r"\b(?:top|main|largest|biggest|leading|most important)\s+(?:exports|products|goods|items|commodities)\b",
+        r"\b(?:export basket|basket of exports)\b",
+        r"\bwhat\s+are\s+lebanon(?:'s| s)?\s+(?:main\s+|top\s+)?exports\s+to\b",
+    )
+    return any(re.search(pattern, q) for pattern in patterns)
+
+
+def _requested_market_columns(parsed: ParsedQuestion, include_rank: bool = False) -> list[str]:
+    """Return only the market indicators explicitly requested by the user."""
+    columns = ["country", "continent", "year", "export_value", "n_products"]
+    if "expy" in parsed.measures:
+        columns.append("expy")
+    if "hhi" in parsed.measures:
+        columns.append("hhi")
+    if "rca" in parsed.measures:
+        columns.append("rca")
+    if "potential" in parsed.measures:
+        columns.append("unrealized_potential_usd")
+    if "performance" in parsed.measures:
+        columns.extend(["status", "priority"])
+    if "cagr" in parsed.measures or "growth" in parsed.measures:
+        columns.append("cagr")
+    if include_rank:
+        columns.append("metric_rank")
+    return list(dict.fromkeys(columns))
+
+
+
+def _asks_for_market_by_product_count(q: str) -> bool:
+    """Detect country/market lists filtered by the number of exported products."""
+    q = _norm_text(q)
+    has_market_dimension = bool(
+        re.search(r"\b(?:country|countries|market|markets|destination|destinations|where)\b", q)
+        or re.search(r"\bto what\b", q)
+    )
+    has_product_threshold = bool(
+        re.search(
+            r"\b(?:more than|over|above|greater than|at least|no fewer than|"
+            r"fewer than|less than|under|below|at most|no more than)\s+"
+            r"\d+(?:\.\d+)?\s+(?:(?:distinct|different|lebanese|exported|industrial)\s+)*products\b",
+            q,
+        )
+    )
+    return has_market_dimension and has_product_threshold
+
+
+def _extract_unresolved_product_phrase(question: str) -> str | None:
+    """Extract a likely product phrase when no catalog product was resolved."""
+    raw = re.sub(r"\s+", " ", str(question or "").strip())
+    patterns = (
+        r"how much (?P<item>.+?) (?:did|does|do) lebanon (?:export|sell|ship)(?: in 20\d{2})?\??$",
+        r"how much of (?P<item>.+?) (?:did|does|do) lebanon (?:export|sell|ship)(?: in 20\d{2})?\??$",
+        r"how much (?:did |does |do )?lebanon (?:export|sell|ship) of (?P<item>.+?)(?: in 20\d{2}| to [A-Z][^?]*|$)",
+        r"how much (?:did |does |do )?lebanon (?:export|sell|ship) (?P<item>(?!(?:to|into|toward|towards)\b).+?)(?: in 20\d{2}| to [A-Z][^?]*|$)",
+        r"where (?:does|did) lebanon (?:export|sell|ship) (?P<item>.+?)(?: in 20\d{2}|$)",
+        r"what countries (?:buy|import|purchase) (?P<item>.+?) from lebanon",
+        r"what markets (?:buy|import|purchase) (?P<item>.+?) from lebanon",
+        r"exports? of (?P<item>.+?)(?: in 20\d{2}| to [A-Z][^?]*|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        if not match:
+            continue
+        item = match.group("item").strip(" ?.,")
+        norm = _norm_text(item)
+        if norm.startswith(("to ", "into ", "toward ", "towards ")):
+            continue
+        if not norm or norm in {
+            "products", "goods", "items", "commodities", "industrial products",
+            "more than products",
+        }:
+            continue
+        if len(norm.split()) <= 8:
+            return item
+    return None
+
+
+
+def _product_reference_remainder(question: str, product: ProductMatch) -> str:
+    """Remove the resolved product reference before parsing other intent."""
+    q = _norm_text(question)
+    product_norm = _norm_text(product.name)
+    if product_norm and product_norm in q:
+        return re.sub(r"\s+", " ", q.replace(product_norm, " ", 1)).strip()
+
+    aliases = [
+        alias for alias, hs6 in PRODUCT_ALIASES.items()
+        if hs6 == product.hs6 and _phrase_present(q, alias)
+    ]
+    if aliases:
+        alias = max(aliases, key=len)
+        alias_norm = _norm_text(alias)
+        return re.sub(
+            r"\s+",
+            " ",
+            re.sub(
+                rf"(?<![a-z0-9]){re.escape(alias_norm)}(?![a-z0-9])",
+                " ",
+                q,
+                count=1,
+            ),
+        ).strip()
+
+    # Remove an explicit HS6 reference while retaining the surrounding command.
+    if re.search(rf"\b{re.escape(product.hs6)}\b", q):
+        return re.sub(
+            r"\s+",
+            " ",
+            re.sub(rf"\b{re.escape(product.hs6)}\b", " ", q, count=1),
+        ).strip()
+    return q
+
+
+def _explicit_code_request(question: str) -> bool:
+    """Recognize true code requests without using numbers inside product names."""
+    q = _norm_text(question)
+    if re.search(
+        r"\b(?:hs|hs4|hs6|h s|harmonized|harmonised|tariff|customs|product code|code)\b",
+        q,
+    ):
+        return True
+    years = {str(year) for year in range(2018, 2101)}
+    tokens = [
+        token for token in re.findall(r"\b\d{6}\b", question)
+        if token not in years
+    ]
+    return bool(tokens and len(q.split()) <= 6)
 
 
 def parse_question(question: str) -> ParsedQuestion:
@@ -571,11 +791,13 @@ def parse_question(question: str) -> ParsedQuestion:
     years = _extract_years(original)
     operation, ascending = _parse_operation(q, years)
     continents = _find_named(original, _catalog()["continents"], {"middle east": "Asia"})
+    products = _find_products(original)
+
     parsed = ParsedQuestion(
         original=original,
         norm=q,
         years=years,
-        products=_find_products(original),
+        products=products,
         markets=_find_named(original, _catalog()["market_names"], MARKET_ALIASES),
         sectors=_find_named(original, _catalog()["sectors"], SECTOR_ALIASES),
         continents=continents,
@@ -584,11 +806,53 @@ def parse_question(question: str) -> ParsedQuestion:
         operation=operation,
         limit=_extract_limit(original),
         ascending=ascending,
-        explicit_code=bool(re.search(r"\b(?:hs|h s|harmonized|harmonised|tariff|customs)\b|\b\d{4,6}\b", q)),
+        explicit_code=_explicit_code_request(original),
         filters=_parse_numeric_filters(original),
     )
-    return parsed
 
+    # Once one product is resolved, remove that exact product reference before
+    # reading the remaining market, sector, metric, and operation words. Long
+    # customs descriptions frequently contain terms such as "metals" or
+    # "china" that are part of the product name rather than user filters.
+    if len(products) == 1:
+        remainder = _product_reference_remainder(original, products[0])
+        parsed.markets = _find_named(
+            remainder,
+            _catalog()["market_names"],
+            MARKET_ALIASES,
+        )
+        parsed.sectors = _find_named(
+            remainder,
+            _catalog()["sectors"],
+            SECTOR_ALIASES,
+        )
+        parsed.continents = _find_named(
+            remainder,
+            _catalog()["continents"],
+            {"middle east": "Asia"},
+        )
+        parsed.measures = _parse_measures(remainder)
+        parsed.group = _parse_group(remainder)
+        parsed.operation, parsed.ascending = _parse_operation(remainder, years)
+        parsed.filters = _parse_numeric_filters(remainder)
+
+    # Questions such as "to what countries does Lebanon export more than
+    # 500 products?" refer to destination markets filtered by product count.
+    if _asks_for_market_by_product_count(q):
+        parsed.group = "market"
+        parsed.measures.add("n_products")
+        parsed.operation = "list"
+
+    # Natural market-basket questions such as "what does Lebanon export to
+    # Syria the most?" must rank products within Syria. They must not be
+    # interpreted as a request for Syria's rank among destination markets.
+    if parsed.markets and not parsed.products and _asks_for_products_in_market(q):
+        parsed.group = "product"
+        if re.search(r"\b(?:most|top|main|largest|biggest|leading|best)\b", q):
+            parsed.operation = "rank"
+        elif parsed.operation == "lookup":
+            parsed.operation = "list"
+    return parsed
 
 def resolve_dashboard_entities(question: str) -> dict[str, Any]:
     parsed = parse_question(question)
@@ -609,6 +873,543 @@ def resolve_dashboard_entities(question: str) -> dict[str, Any]:
     if parsed.measures:
         entities["metric"] = sorted(parsed.measures)[0]
     return entities
+
+
+
+# ---------------------------------------------------------------------------
+# Complete product knowledge profiles
+# ---------------------------------------------------------------------------
+
+_FULL_PRODUCT_PROFILE_TERMS = (
+    "all details", "every detail", "everything about", "everything on",
+    "full profile", "complete profile", "complete details", "all information",
+    "all data", "full details", "complete information", "detailed profile",
+)
+
+_SIMPLE_PRODUCT_PROFILE_TERMS = (
+    "product profile", "profile of", "profile for", "overview of",
+    "tell me about", "what do you know about", "information about",
+    "details about", "details on", "describe", "summary of",
+)
+
+
+@lru_cache(maxsize=1)
+def _latest_product_year() -> int:
+    with sqlite3.connect(_database_path()) as conn:
+        row = conn.execute("SELECT MAX(year) FROM product_year").fetchone()
+    return int(row[0]) if row and row[0] is not None else 2025
+
+
+def _product_profile_level(parsed: ParsedQuestion) -> str | None:
+    """Return simple/full for broad product-profile questions.
+
+    The exact product name is removed before interpreting the remaining words.
+    This prevents words inside long customs descriptions from being mistaken
+    for a separate market, sector, metric, or query instruction.
+    """
+    if len(parsed.products) != 1:
+        return None
+
+    product = parsed.products[0]
+    q = parsed.norm
+    product_norm = _norm_text(product.name)
+
+    # Remove the authoritative exact product name before reading intent. For a
+    # common-language alias, the alias stays in the remainder but does not
+    # create false sector or market entities.
+    remainder = q
+    if product_norm and product_norm in remainder:
+        remainder = remainder.replace(product_norm, " ", 1)
+    remainder = re.sub(r"\s+", " ", remainder).strip()
+
+    explicit_markets = _find_named(
+        remainder,
+        _catalog()["market_names"],
+        MARKET_ALIASES,
+    )
+    explicit_sectors = _find_named(
+        remainder,
+        _catalog()["sectors"],
+        SECTOR_ALIASES,
+    )
+    explicit_continents = _find_named(
+        remainder,
+        _catalog()["continents"],
+        {"middle east": "Asia"},
+    )
+    if explicit_markets or explicit_sectors or explicit_continents:
+        return None
+
+    if any(term in remainder or term in q for term in _FULL_PRODUCT_PROFILE_TERMS):
+        return "full"
+
+    # Destination, value, count, ranking and comparison wording must answer the
+    # requested product question rather than opening a general profile.
+    dedicated_intent_patterns = (
+        r"^where\b",
+        r"^which\s+(?:countries|markets|destinations)\b",
+        r"^what\s+(?:countries|markets|destinations)\b",
+        r"\b(?:top|main|largest|leading|best)\s+(?:countries|markets|destinations)\b",
+        r"\bhow much\b",
+        r"\bhow many\b",
+        r"\b(?:export value|amount exported|total exports?|rank|ranking|share|percentage)\b",
+        r"\b(?:trend|history|over time|year by year|compare|versus|\bvs\b)\b",
+    )
+    if any(re.search(pattern, remainder) for pattern in dedicated_intent_patterns):
+        return None
+
+    # Interpret metrics and operations only from words outside the exact name.
+    remainder_measures = _parse_measures(remainder)
+    specific_measures = {
+        "rca", "pci", "complexity", "hhi", "expy", "cagr", "growth",
+        "potential", "market_size", "penetration", "share", "n_markets",
+        "performance", "entry", "exit",
+    }
+    if remainder_measures & specific_measures:
+        return None
+    remainder_operation, _ = _parse_operation(remainder, parsed.years)
+    if remainder_operation not in {"lookup", "definition"}:
+        return None
+
+    if any(term in remainder or term in q for term in _SIMPLE_PRODUCT_PROFILE_TERMS):
+        return "simple"
+
+    alias_hit = any(
+        _phrase_present(q, alias) and hs6 == product.hs6
+        for alias, hs6 in PRODUCT_ALIASES.items()
+    )
+
+    # Remove harmless profile phrasing from the instruction remainder. If
+    # nothing meaningful remains, the prompt is a general product request.
+    reduced = re.sub(
+        r"\b(?:what|is|are|the|a|an|product|about|lebanon|lebanese|exports?|"
+        r"tell|me|show|give|information|details|profile|overview|of|on|for|"
+        r"please|this|that)\b",
+        " ",
+        remainder,
+    )
+    reduced = re.sub(r"\s+", " ", reduced).strip()
+
+    if q == product_norm or alias_hit or not reduced:
+        return "simple"
+    if len(remainder.split()) <= 4 and not remainder_measures:
+        return "simple"
+    return None
+
+def _safe_ratio(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator else 0.0
+
+
+def _pct_text(value: float | None, signed: bool = False) -> str:
+    if value is None:
+        return "Not calculable"
+    prefix = "+" if signed and value > 0 else ""
+    return f"{prefix}{value * 100:.1f}%"
+
+
+@lru_cache(maxsize=4096)
+def _product_profile_data(hs6: str, year: int) -> dict[str, Any]:
+    """Load every product-related dashboard fact needed by the answer layer."""
+    hs6 = str(hs6).zfill(6)
+    with sqlite3.connect(_database_path()) as conn:
+        conn.row_factory = sqlite3.Row
+
+        base_row = conn.execute(
+            "SELECT * FROM products_master WHERE printf('%06d',CAST(hs6 AS INTEGER))=? LIMIT 1",
+            (hs6,),
+        ).fetchone()
+        if base_row is None:
+            return {}
+        base = dict(base_row)
+
+        annual = [
+            dict(row) for row in conn.execute(
+                "SELECT year,export_value,rca,pci,n_countries,"
+                "unrealized_potential_usd,cagr,growth,trajectory "
+                "FROM product_year WHERE hs6=? ORDER BY year",
+                (hs6,),
+            )
+        ]
+        annual_by_year = {int(row["year"]): row for row in annual}
+        latest = annual_by_year.get(year) or (annual[-1] if annual else {})
+        actual_year = int(latest.get("year") or year)
+        latest_value = float(latest.get("export_value") or 0)
+
+        overview = conn.execute(
+            "SELECT total_exports_usd,active_products FROM export_overview WHERE year=?",
+            (actual_year,),
+        ).fetchone()
+        total_exports = float(overview["total_exports_usd"] or 0) if overview else 0.0
+        active_products = int(overview["active_products"] or 0) if overview else 0
+
+        overall_rank_row = conn.execute(
+            "WITH ranked AS ("
+            "SELECT hs6,RANK() OVER (ORDER BY export_value DESC) AS rank_value "
+            "FROM product_year WHERE year=? AND export_value>0"
+            ") SELECT rank_value FROM ranked WHERE hs6=?",
+            (actual_year, hs6),
+        ).fetchone()
+        overall_rank = int(overall_rank_row["rank_value"]) if overall_rank_row else None
+
+        sector = str(base.get("sector") or latest.get("sector") or "")
+        sector_total_row = conn.execute(
+            "SELECT SUM(export_value) AS sector_total,COUNT(*) AS active_sector_products "
+            "FROM product_year WHERE year=? AND sector=? AND export_value>0",
+            (actual_year, sector),
+        ).fetchone()
+        sector_total = float(sector_total_row["sector_total"] or 0) if sector_total_row else 0.0
+        active_sector_products = int(sector_total_row["active_sector_products"] or 0) if sector_total_row else 0
+
+        sector_rank_row = conn.execute(
+            "WITH ranked AS ("
+            "SELECT hs6,RANK() OVER (ORDER BY export_value DESC) AS rank_value "
+            "FROM product_year WHERE year=? AND sector=? AND export_value>0"
+            ") SELECT rank_value FROM ranked WHERE hs6=?",
+            (actual_year, sector, hs6),
+        ).fetchone()
+        sector_rank = int(sector_rank_row["rank_value"]) if sector_rank_row else None
+
+        destinations = [
+            dict(row) for row in conn.execute(
+                "SELECT country,continent,value_usd,share_of_product_exports,"
+                "share_of_market_exports FROM product_market_share "
+                "WHERE hs6=? AND year=? AND value_usd>0 "
+                "ORDER BY value_usd DESC,country ASC",
+                (hs6, actual_year),
+            )
+        ]
+
+        market_sets: dict[int, set[str]] = {}
+        for row in conn.execute(
+            "SELECT year,country FROM product_market_year "
+            "WHERE hs6=? AND value_usd>0 ORDER BY year,country",
+            (hs6,),
+        ):
+            market_sets.setdefault(int(row["year"]), set()).add(str(row["country"]))
+        first_year = min(market_sets) if market_sets else min(annual_by_year, default=2018)
+        first_markets = market_sets.get(first_year, set())
+        latest_markets = market_sets.get(actual_year, set())
+        entered_markets = sorted(latest_markets - first_markets)
+        exited_markets = sorted(first_markets - latest_markets)
+        lifetime_markets = sorted(set().union(*market_sets.values())) if market_sets else []
+
+        potential_rows = [
+            dict(row) for row in conn.execute(
+                "SELECT country,MAX(value_usd) AS unrealized_potential_usd "
+                "FROM up_pairs WHERE CAST(hs6 AS INTEGER)=CAST(? AS INTEGER) "
+                "GROUP BY country HAVING MAX(value_usd)>0 "
+                "ORDER BY unrealized_potential_usd DESC,country ASC",
+                (hs6,),
+            )
+        ]
+        total_potential = sum(float(row.get("unrealized_potential_usd") or 0) for row in potential_rows)
+
+        market_sizes = [
+            dict(row) for row in conn.execute(
+                "WITH latest AS ("
+                "SELECT country,MAX(year) AS year FROM market_size_hs6 "
+                "WHERE hs6=? GROUP BY country"
+                ") "
+                "SELECT m.country,m.year,m.market_size_usd,"
+                "COALESCE(e.value_usd,0) AS lebanon_exports_same_year,"
+                "CASE WHEN m.market_size_usd>0 "
+                "THEN COALESCE(e.value_usd,0)/m.market_size_usd ELSE NULL END AS market_penetration "
+                "FROM market_size_hs6 m "
+                "JOIN latest l ON l.country=m.country AND l.year=m.year "
+                "LEFT JOIN product_market_year e "
+                "ON e.hs6=m.hs6 AND e.country=m.country AND e.year=m.year "
+                "WHERE m.hs6=? "
+                "ORDER BY m.market_size_usd DESC,m.country ASC",
+                (hs6, hs6),
+            )
+        ]
+
+    # Trend calculations end in the profile's selected year. The complete
+    # annual history remains available separately for full-profile requests.
+    values = [
+        (int(row["year"]), float(row.get("export_value") or 0))
+        for row in annual
+        if int(row["year"]) <= actual_year
+    ]
+    start_year, start_value = values[0] if values else (actual_year, 0.0)
+    end_year, end_value = values[-1] if values else (actual_year, latest_value)
+    absolute_change = end_value - start_value
+    percentage_change = (end_value / start_value - 1) if start_value else None
+    peak_year, peak_value = max(values, key=lambda item: item[1]) if values else (actual_year, latest_value)
+    low_year, low_value = min(values, key=lambda item: item[1]) if values else (actual_year, latest_value)
+    destination_hhi = sum(
+        float(row.get("share_of_product_exports") or 0) ** 2
+        for row in destinations
+    )
+    top_destination = destinations[0] if destinations else None
+
+    return {
+        "base": base,
+        "annual": annual,
+        "latest": latest,
+        "actual_year": actual_year,
+        "latest_value": latest_value,
+        "total_exports": total_exports,
+        "active_products": active_products,
+        "overall_rank": overall_rank,
+        "sector": sector,
+        "sector_total": sector_total,
+        "sector_rank": sector_rank,
+        "active_sector_products": active_sector_products,
+        "destinations": destinations,
+        "market_sets": {year_key: sorted(values_set) for year_key, values_set in market_sets.items()},
+        "first_year": first_year,
+        "entered_markets": entered_markets,
+        "exited_markets": exited_markets,
+        "lifetime_markets": lifetime_markets,
+        "potential_rows": potential_rows,
+        "total_potential": total_potential,
+        "market_sizes": market_sizes,
+        "start_year": start_year,
+        "start_value": start_value,
+        "end_year": end_year,
+        "end_value": end_value,
+        "absolute_change": absolute_change,
+        "percentage_change": percentage_change,
+        "peak_year": peak_year,
+        "peak_value": peak_value,
+        "low_year": low_year,
+        "low_value": low_value,
+        "destination_hhi": destination_hhi,
+        "top_destination": top_destination,
+    }
+
+
+def _product_interpretation(profile: dict[str, Any]) -> list[str]:
+    """Create compact, factual interpretation without unsupported causality."""
+    latest_value = float(profile.get("latest_value") or 0)
+    start_value = float(profile.get("start_value") or 0)
+    pct_change = profile.get("percentage_change")
+    destinations = list(profile.get("destinations") or [])
+    top = profile.get("top_destination")
+    lines: list[str] = []
+
+    if pct_change is None:
+        lines.append(
+            "The product has no non-zero starting base for a percentage comparison, so the dollar trend is more informative than a growth percentage."
+        )
+    elif pct_change > 0.25:
+        lines.append(
+            f"Export value is materially above its {profile.get('start_year')} level."
+        )
+    elif pct_change < -0.25:
+        lines.append(
+            f"Export value is materially below its {profile.get('start_year')} level."
+        )
+    else:
+        lines.append(
+            f"Export value is relatively close to its {profile.get('start_year')} level."
+        )
+
+    if top:
+        top_share = float(top.get("share_of_product_exports") or 0)
+        if top_share >= 0.60:
+            lines.append(
+                f"The product is highly dependent on {top.get('country')}, which accounts for {_pct_text(top_share)} of its exports."
+            )
+        elif top_share >= 0.35:
+            lines.append(
+                f"{top.get('country')} is the leading destination at {_pct_text(top_share)}, but other markets also contribute materially."
+            )
+        else:
+            lines.append(
+                f"No single destination exceeds 35% of exports; the largest is {top.get('country')} at {_pct_text(top_share)}."
+            )
+    elif latest_value > 0:
+        lines.append("The latest export value is positive, but no destination breakdown is available.")
+    else:
+        lines.append("The product records no positive exports in the latest dashboard year.")
+
+    if len(destinations) >= 25:
+        lines.append(f"The product has broad current reach across {len(destinations):,} destination markets.")
+    elif len(destinations) > 0:
+        lines.append(f"The product currently reaches {len(destinations):,} destination markets.")
+    return lines
+
+
+def _build_product_profile_answer(
+    product: ProductMatch,
+    level: str,
+    requested_year: int | None,
+    show_code: bool,
+) -> str:
+    year = requested_year or _latest_product_year()
+    profile = _product_profile_data(product.hs6, year)
+    if not profile:
+        return "No product profile is available for that exact dashboard product."
+
+    base = profile["base"]
+    latest = profile["latest"]
+    actual_year = int(profile["actual_year"])
+    name = str(base.get("name") or product.name)
+    sector = str(profile.get("sector") or product.sector)
+    latest_value = float(profile.get("latest_value") or 0)
+    total_share = _safe_ratio(latest_value, float(profile.get("total_exports") or 0))
+    sector_share = _safe_ratio(latest_value, float(profile.get("sector_total") or 0))
+    destinations = list(profile.get("destinations") or [])
+    lines: list[str] = []
+
+    lines.extend([
+        "**Current position**",
+        f"- **Product:** {name}",
+        f"- **Sector:** {sector}",
+    ])
+    if show_code:
+        lines.append(f"- **HS6 code:** {product.hs6}")
+    lines.extend([
+        f"- **Exports in {actual_year}:** {_money(latest_value)}",
+        f"- **Overall product rank:** {('#' + format(profile['overall_rank'], ',')) if profile.get('overall_rank') else 'Not ranked because exports are zero'}"
+        + (f" of {int(profile.get('active_products') or 0):,} active products" if profile.get("active_products") else ""),
+        f"- **Rank within {sector}:** {('#' + format(profile['sector_rank'], ',')) if profile.get('sector_rank') else 'Not ranked'}"
+        + (f" of {int(profile.get('active_sector_products') or 0):,} active sector products" if profile.get("active_sector_products") else ""),
+        f"- **Share of Lebanon's industrial exports:** {_pct_text(total_share)}",
+        f"- **Share of the {sector} sector:** {_pct_text(sector_share)}",
+        f"- **Destination markets in {actual_year}:** {len(destinations):,}",
+        f"- **Lifetime destination markets:** {len(profile.get('lifetime_markets') or []):,}",
+    ])
+
+    lines.extend(["", f"**Leading destinations in {actual_year}**"])
+    if destinations:
+        for index, row in enumerate(destinations[:5], 1):
+            lines.append(
+                f"{index}. **{row.get('country')}** - {_money(row.get('value_usd'))} "
+                f"({_pct_text(float(row.get('share_of_product_exports') or 0))} of this product's exports)"
+            )
+    else:
+        lines.append("- No positive destination-level exports are recorded.")
+
+    lines.extend([
+        "",
+        "**Export trend**",
+        f"- **{profile.get('start_year')}:** {_money(profile.get('start_value'))}",
+        f"- **{profile.get('end_year')}:** {_money(profile.get('end_value'))}",
+        f"- **Dollar change:** {_money(profile.get('absolute_change'))}",
+        f"- **Percentage change:** {_pct_text(profile.get('percentage_change'), signed=True)}",
+        f"- **Peak year:** {profile.get('peak_year')} at {_money(profile.get('peak_value'))}",
+    ])
+
+    interpretations = _product_interpretation(profile)
+    if interpretations:
+        lines.extend(["", "**What the figures show**"])
+        lines.extend(f"- {item}" for item in interpretations)
+
+    if level == "full":
+        lines.extend(["", "**Complete annual history**"])
+        for row in profile.get("annual") or []:
+            lines.append(
+                f"- **{int(row.get('year'))}:** {_money(row.get('export_value'))}; "
+                f"{int(row.get('n_countries') or 0):,} destination markets"
+            )
+
+        first_year = int(profile.get("first_year") or profile.get("start_year") or 2018)
+        entered = list(profile.get("entered_markets") or [])
+        exited = list(profile.get("exited_markets") or [])
+        lines.extend([
+            "",
+            f"**Destination changes since {first_year}**",
+            f"- **Markets present now but not in {first_year}:** {len(entered):,}"
+            + (f" - {', '.join(entered[:12])}" if entered else ""),
+            f"- **Markets present in {first_year} but not now:** {len(exited):,}"
+            + (f" - {', '.join(exited[:12])}" if exited else ""),
+            f"- **Destination concentration (HHI):** {float(profile.get('destination_hhi') or 0):.3f}",
+        ])
+
+        rca = latest.get("rca")
+        pci = latest.get("pci")
+        cagr = latest.get("cagr")
+        lines.extend(["", "**Competitiveness, complexity and growth indicators**"])
+        lines.append(
+            f"- **RCA in {actual_year}:** {_format_value(rca, 'rca') if rca is not None else 'Not available'}"
+            + (" - above the specialization threshold of 1" if rca is not None and float(rca) >= 1 else "")
+        )
+        lines.append(
+            f"- **PCI:** {_format_value(pci, 'pci') if pci is not None else 'Not available'}"
+        )
+        lines.append(
+            f"- **CAGR:** {_format_value(cagr, 'cagr') if cagr is not None else 'Not calculable'}"
+        )
+        if latest.get("trajectory"):
+            lines.append(f"- **Trajectory:** {latest.get('trajectory')}")
+
+        potential_rows = list(profile.get("potential_rows") or [])
+        lines.extend(["", "**Recorded unrealized potential**"])
+        lines.append(
+            f"- **Total recorded potential:** {_money(profile.get('total_potential'))}"
+        )
+        lines.append(
+            f"- **Markets with recorded potential:** {len(potential_rows):,}"
+        )
+        for index, row in enumerate(potential_rows[:5], 1):
+            lines.append(
+                f"{index}. **{row.get('country')}** - {_money(row.get('unrealized_potential_usd'))}"
+            )
+        if not potential_rows:
+            lines.append("- No positive product-country potential pair is recorded.")
+
+        market_sizes = list(profile.get("market_sizes") or [])
+        lines.extend(["", "**Largest recorded import markets for this product**"])
+        if market_sizes:
+            for index, row in enumerate(market_sizes[:5], 1):
+                penetration = row.get("market_penetration")
+                penetration_text = (
+                    f"; Lebanon's share in that observation year: {_pct_text(float(penetration))}"
+                    if penetration is not None else ""
+                )
+                lines.append(
+                    f"{index}. **{row.get('country')}** - {_money(row.get('market_size_usd'))} "
+                    f"in {int(row.get('year'))}{penetration_text}"
+                )
+        else:
+            lines.append("- No market-size observations are available for this product.")
+
+        lines.extend([
+            "",
+            "**How to use the complete profile**",
+            "- Export values and destination shares describe recorded trade, not profitability.",
+            "- Market-size observations may use a year earlier than the latest export year.",
+            "- Unrealized potential is an opportunity estimate, not a guaranteed forecast.",
+        ])
+
+    return "\n".join(lines)
+
+
+def _product_profile_plan(parsed: ParsedQuestion) -> QueryPlan | None:
+    level = _product_profile_level(parsed)
+    if level is None:
+        return None
+    product = parsed.products[0]
+    requested_year = parsed.years[-1] if parsed.years else None
+    answer = _build_product_profile_answer(
+        product,
+        level=level,
+        requested_year=requested_year,
+        show_code=parsed.explicit_code,
+    )
+    entities = {
+        "products": [product.hs6],
+        "hs6": product.hs6,
+        "product_names": [product.name],
+        "year": requested_year or _latest_product_year(),
+        "metric": "product_profile",
+        "profile_level": level,
+    }
+    title = (
+        f"Complete profile for {product.name}"
+        if level == "full"
+        else f"Product profile for {product.name}"
+    )
+    return QueryPlan(
+        title,
+        kind="direct",
+        direct_answer=answer,
+        entities=entities,
+        confidence=1.0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -742,21 +1543,35 @@ def _pair_plan(parsed: ParsedQuestion) -> QueryPlan | None:
     entities = {"hs6": product.hs6, "market": market, "product_names": [product.name], "metric": sorted(parsed.measures)[0]}
 
     if "penetration" in parsed.measures:
-        if parsed.years:
-            year = parsed.years[-1]
-        else:
-            with sqlite3.connect(_database_path()) as conn:
-                row = conn.execute("SELECT MAX(year) FROM market_size_hs6 WHERE hs6=? AND country=?", (product.hs6, market)).fetchone()
-            year = int(row[0]) if row and row[0] else 2024
+        requested_year = parsed.years[-1] if parsed.years else None
+        with sqlite3.connect(_database_path()) as conn:
+            row = conn.execute(
+                "SELECT MAX(year) FROM market_size_hs6 WHERE hs6=? AND country=?" + (" AND year=?" if requested_year else ""),
+                (product.hs6, market, requested_year) if requested_year else (product.hs6, market),
+            ).fetchone()
+            exact_year = int(row[0]) if row and row[0] else None
+            if exact_year is None:
+                fallback = conn.execute("SELECT MAX(year) FROM market_size_hs6 WHERE hs6=? AND country=?", (product.hs6, market)).fetchone()
+                exact_year = int(fallback[0]) if fallback and fallback[0] else None
+        if exact_year is None:
+            return QueryPlan(
+                f"Market penetration for {product.name} in {market}",
+                kind="direct",
+                direct_answer="No market-size observation is available for this product-country pair, so market penetration cannot be calculated from the dashboard.",
+                entities=entities,
+            )
+        notes = ()
+        if requested_year and exact_year != requested_year:
+            notes = (f"Market-size data for {requested_year} are unavailable for this exact product-country pair. The calculation below uses the latest available year, {exact_year}.",)
         sql = (
             "WITH e AS (SELECT COALESCE(SUM(value_usd),0) AS exports FROM product_market_year "
-            f"WHERE hs6={hs} AND country={mk} AND year={year}), "
-            "m AS (SELECT COALESCE(MAX(market_size_usd),0) AS market_size FROM market_size_hs6 "
-            f"WHERE hs6={hs} AND country={mk} AND year={year}) "
-            f"SELECT {_sql_quote(product.name)} AS product_name,{mk} AS country,{year} AS year,e.exports AS value_usd,m.market_size AS market_size_usd,"
+            f"WHERE hs6={hs} AND country={mk} AND year={exact_year}), "
+            "m AS (SELECT MAX(market_size_usd) AS market_size FROM market_size_hs6 "
+            f"WHERE hs6={hs} AND country={mk} AND year={exact_year}) "
+            f"SELECT {_sql_quote(product.name)} AS product_name,{mk} AS country,{exact_year} AS year,e.exports AS value_usd,m.market_size AS market_size_usd,"
             "CASE WHEN m.market_size>0 THEN e.exports/m.market_size ELSE NULL END AS market_penetration FROM e CROSS JOIN m"
         )
-        return QueryPlan(f"Lebanon's penetration of the {product.name} market in {market}, {year}", sql, entities=entities)
+        return QueryPlan(f"Lebanon's market penetration for {product.name} in {market}", sql, entities=entities, notes=notes)
     if "potential" in parsed.measures and any(term in parsed.norm for term in ("actual", "gap", "versus", "compare", "realized")):
         year = _year(parsed)
         sql = (
@@ -769,18 +1584,32 @@ def _pair_plan(parsed: ParsedQuestion) -> QueryPlan | None:
         )
         return QueryPlan(f"Actual exports and unrealized potential for {product.name} in {market}", sql, entities=entities)
     if "market_size" in parsed.measures:
-        if parsed.years:
-            year_clause = f"AND m.year={parsed.years[-1]}"
-            title_year = str(parsed.years[-1])
-        else:
-            year_clause = "AND m.year=(SELECT MAX(year) FROM market_size_hs6 WHERE hs6=" + hs + " AND country=" + mk + ")"
-            title_year = "latest available year"
+        requested_year = parsed.years[-1] if parsed.years else None
+        with sqlite3.connect(_database_path()) as conn:
+            if requested_year:
+                row = conn.execute("SELECT MAX(year) FROM market_size_hs6 WHERE hs6=? AND country=? AND year=?", (product.hs6, market, requested_year)).fetchone()
+                exact_year = int(row[0]) if row and row[0] else None
+            else:
+                exact_year = None
+            if exact_year is None:
+                row = conn.execute("SELECT MAX(year) FROM market_size_hs6 WHERE hs6=? AND country=?", (product.hs6, market)).fetchone()
+                exact_year = int(row[0]) if row and row[0] else None
+        if exact_year is None:
+            return QueryPlan(
+                f"{product.name} market size in {market}",
+                kind="direct",
+                direct_answer="No market-size observation is available for this exact product-country pair in the dashboard.",
+                entities=entities,
+            )
+        notes = ()
+        if requested_year and exact_year != requested_year:
+            notes = (f"Market-size data for {requested_year} are unavailable for this exact product-country pair. The latest available observation is {exact_year}.",)
         sql = (
             "SELECT m.country,m.year,p.name AS product_name,m.market_size_usd "
             "FROM market_size_hs6 m JOIN products_master p ON CAST(p.hs6 AS TEXT)=m.hs6 "
-            f"WHERE m.hs6={hs} AND m.country={mk} {year_clause} LIMIT 1"
+            f"WHERE m.hs6={hs} AND m.country={mk} AND m.year={exact_year} LIMIT 1"
         )
-        return QueryPlan(f"{product.name} market size in {market} ({title_year})", sql, entities=entities)
+        return QueryPlan(f"{product.name} market size in {market}", sql, entities=entities, notes=notes)
     if "potential" in parsed.measures:
         sql = (
             "SELECT p.name AS product_name,u.country,u.value_usd AS unrealized_potential_usd "
@@ -789,12 +1618,15 @@ def _pair_plan(parsed: ParsedQuestion) -> QueryPlan | None:
         )
         return QueryPlan(f"Unrealized potential for {product.name} in {market}", sql, entities=entities)
     if parsed.operation == "trend" or len(parsed.years) >= 2:
-        condition = _years_condition("year", parsed)
+        start, end = (min(parsed.years), max(parsed.years)) if parsed.years else (2018, 2025)
         sql = (
-            "SELECT year,product_name,country,value_usd,share_of_product_exports,share_of_market_exports,rca,pci "
-            f"FROM product_market_share WHERE hs6={hs} AND country={mk}{condition} ORDER BY year"
+            "WITH years AS (SELECT year FROM totals_by_year WHERE year BETWEEN " + str(start) + " AND " + str(end) + "), "
+            "series AS (SELECT year,SUM(value_usd) AS value_usd FROM product_market_year "
+            f"WHERE hs6={hs} AND country={mk} AND year BETWEEN {start} AND {end} GROUP BY year) "
+            f"SELECT y.year,{_sql_quote(product.name)} AS product_name,{mk} AS country,COALESCE(s.value_usd,0) AS value_usd "
+            "FROM years y LEFT JOIN series s USING(year) ORDER BY y.year"
         )
-        return QueryPlan(f"{product.name} exports to {market}", sql, entities=entities)
+        return QueryPlan(f"{product.name} exports to {market}, {start}-{end}", sql, entities=entities)
     year = _year(parsed)
     if parsed.operation == "rank" or "rank" in parsed.norm:
         if "in market" in parsed.norm or "among products" in parsed.norm or "within" in parsed.norm:
@@ -860,7 +1692,12 @@ def _product_plan(parsed: ParsedQuestion) -> QueryPlan | None:
     if not parsed.products:
         return None
     products = parsed.products
-    entities = {"products": [p.hs6 for p in products], "hs6": products[-1].hs6, "product_names": [p.name for p in products], "metric": sorted(parsed.measures)[0]}
+    entities = {
+        "products": [p.hs6 for p in products],
+        "hs6": products[-1].hs6,
+        "product_names": [p.name for p in products],
+        "metric": sorted(parsed.measures)[0] if parsed.measures else "exports",
+    }
     if len(products) == 1 and len(parsed.years) >= 2:
         product = products[0]
         values = ",".join(str(y) for y in parsed.years)
@@ -975,6 +1812,24 @@ def _market_plan(parsed: ParsedQuestion) -> QueryPlan | None:
         return QueryPlan(f"Market comparison in {year}", sql, entities=entities)
     market = markets[0]
     mk = _sql_quote(market)
+    if "potential" in parsed.measures and "exports" in parsed.measures and any(term in parsed.norm for term in ("prioritize", "priority", "based on", "screen", "opportunity")):
+        year = _year(parsed)
+        sql = (
+            "WITH actual AS (SELECT hs6,product_name,sector,SUM(value_usd) AS export_value FROM product_market_year "
+            f"WHERE country={mk} AND year={year} GROUP BY hs6,product_name,sector), "
+            "potential AS (SELECT printf('%06d',CAST(hs6 AS INTEGER)) AS hs6,MAX(value_usd) AS unrealized_potential_usd FROM up_pairs "
+            f"WHERE country={mk} GROUP BY CAST(hs6 AS INTEGER)), "
+            "keys AS (SELECT hs6 FROM actual UNION SELECT hs6 FROM potential) "
+            "SELECT COALESCE(a.product_name,p.name) AS product_name,COALESCE(a.sector,p.sector) AS sector,"
+            "COALESCE(a.export_value,0) AS export_value,COALESCE(u.unrealized_potential_usd,0) AS unrealized_potential_usd,"
+            "COALESCE(a.export_value,0)+COALESCE(u.unrealized_potential_usd,0) AS total_addressable_exports "
+            "FROM keys k LEFT JOIN actual a USING(hs6) LEFT JOIN potential u USING(hs6) "
+            "LEFT JOIN products_master p ON CAST(p.hs6 AS TEXT)=k.hs6 "
+            "WHERE COALESCE(a.export_value,0)+COALESCE(u.unrealized_potential_usd,0)>0 "
+            "ORDER BY total_addressable_exports DESC LIMIT " + str(parsed.limit)
+        )
+        entities.update({"year": year, "metric": "export_opportunity_screen"})
+        return QueryPlan(f"Product opportunity screen for {market} in {year}", sql, entities=entities, notes=("Products are ranked by current exports plus recorded unrealized potential. This is a transparent screening measure, not a forecast.",))
     if "similarity" in parsed.measures:
         direct = _similar_market_answer(market, parsed.limit)
         if direct:
@@ -1019,12 +1874,24 @@ def _market_plan(parsed: ParsedQuestion) -> QueryPlan | None:
         order_col, direction = _metric_order(parsed, "product")
         order_map = {"export_value": "value_usd", "unrealized_potential_usd": "value_usd", "cagr": "value_usd"}
         order_col = order_map.get(order_col, order_col)
+        selected = ["product_name", "sector", "value_usd", "share_of_market_exports"]
+        if "rca" in parsed.measures:
+            selected.append("rca")
+        if "pci" in parsed.measures or "complexity" in parsed.measures:
+            selected.append("pci")
         sql = (
-            "SELECT product_name,sector,value_usd,share_of_market_exports,share_of_product_exports,rca,pci "
-            f"FROM product_market_share WHERE country={mk} AND year={year} AND value_usd>0{_threshold_sql(parsed)} "
+            f"SELECT {','.join(selected)} FROM product_market_share "
+            f"WHERE country={mk} AND year={year} AND value_usd>0{_threshold_sql(parsed)} "
             f"ORDER BY {order_col} {direction} LIMIT {parsed.limit}"
         )
-        return QueryPlan(f"Products exported to {market} in {year}", sql, entities=entities)
+        title = (
+            f"Top products Lebanon exported to {market} in {year}"
+            if parsed.operation == "rank"
+            else f"Products Lebanon exported to {market} in {year}"
+        )
+        product_entities = dict(entities)
+        product_entities.update({"group": "product", "year": year, "query_type": "market_product_ranking"})
+        return QueryPlan(title, sql, entities=product_entities)
     if parsed.group == "sector" or re.search(r"\b(?:what|which|top|list).*(?:sectors|industries)\b", parsed.norm):
         year = _year(parsed)
         sql = (
@@ -1049,17 +1916,18 @@ def _market_plan(parsed: ParsedQuestion) -> QueryPlan | None:
     if parsed.operation == "rank":
         year = _year(parsed)
         order_col, direction = _metric_order(parsed, "market")
+        base_columns = _requested_market_columns(parsed, include_rank=False)
+        rank_source = list(dict.fromkeys(base_columns + [order_col]))
+        output_columns = list(dict.fromkeys(base_columns + ["metric_rank"]))
         sql = (
-            f"WITH ranked AS (SELECT country,continent,export_value,n_products,expy,hhi,rca,unrealized_potential_usd,status,cagr,"
+            f"WITH ranked AS (SELECT {','.join(rank_source)},"
             f"RANK() OVER (ORDER BY {order_col} {direction}) AS metric_rank FROM market_year WHERE year={year} AND {order_col} IS NOT NULL) "
-            f"SELECT country,{year} AS year,export_value,n_products,expy,hhi,rca,unrealized_potential_usd,status,cagr,metric_rank FROM ranked WHERE country={mk} LIMIT 1"
+            f"SELECT {','.join(output_columns)} FROM ranked WHERE country={mk} LIMIT 1"
         )
         return QueryPlan(f"Rank of {market} in {year}", sql, entities=entities)
     year = _year(parsed)
-    sql = (
-        "SELECT country,continent,year,export_value,n_products,expy,hhi,rca,unrealized_potential_usd,status,priority,cagr "
-        f"FROM market_year WHERE country={mk} AND year={year} LIMIT 1"
-    )
+    lookup_columns = _requested_market_columns(parsed, include_rank=False)
+    sql = f"SELECT {','.join(lookup_columns)} FROM market_year WHERE country={mk} AND year={year} LIMIT 1"
     return QueryPlan(f"Lebanon's exports to {market} in {year}", sql, entities=entities)
 
 
@@ -1117,7 +1985,8 @@ def _sector_plan(parsed: ParsedQuestion) -> QueryPlan | None:
             f"FROM product_year WHERE sector={sec} AND year={year} AND export_value>0{_threshold_sql(parsed)} "
             f"ORDER BY {order_col} {direction} LIMIT {parsed.limit}"
         )
-        return QueryPlan(f"Products in {sector}, {year}", sql, entities=entities)
+        title = f"Most complex products in {sector}, {year}" if ("pci" in parsed.measures or "complexity" in parsed.measures) and not parsed.ascending else f"Products in {sector}, {year}"
+        return QueryPlan(title, sql, entities=entities)
     if "market_size" in parsed.measures:
         if parsed.years:
             year = parsed.years[-1]
@@ -1312,7 +2181,13 @@ def _ranking_plan(parsed: ParsedQuestion) -> QueryPlan | None:
             "SELECT country,continent,export_value,n_products,expy,hhi,rca,unrealized_potential_usd,status,priority,cagr "
             f"FROM market_year WHERE {condition} ORDER BY {order_col} {direction} LIMIT {parsed.limit}"
         )
-        return QueryPlan(f"Markets ranked by {order_col.replace('_', ' ')} in {year}", sql, entities=entities)
+        if order_col == "hhi" and "diversif" in parsed.norm:
+            title = f"Most diversified export markets in {year}"
+        elif order_col == "hhi" and "concentrat" in parsed.norm:
+            title = f"Most concentrated export markets in {year}"
+        else:
+            title = f"Markets ranked by {order_col.replace('_', ' ')} in {year}"
+        return QueryPlan(title, sql, entities=entities)
 
     if group == "sector":
         if "potential" in parsed.measures:
@@ -1426,6 +2301,90 @@ def _average_plan(parsed: ParsedQuestion) -> QueryPlan | None:
     metric, _ = _metric_order(parsed, "product")
     return QueryPlan(f"Average {metric.replace('_',' ')} across exported products in {year}", f"SELECT AVG({metric}) AS average_{metric},COUNT(*) AS count_value FROM product_year WHERE year={year} AND export_value>0 AND {metric} IS NOT NULL", entities={"year": year, "metric": metric})
 
+
+def _market_product_count_threshold_plan(parsed: ParsedQuestion) -> QueryPlan | None:
+    """List destination countries satisfying a product-count threshold."""
+    if parsed.products or parsed.markets or parsed.sectors:
+        return None
+    if parsed.group != "market":
+        return None
+    count_filters = [item for item in parsed.filters if item[0] == "n_products"]
+    if not count_filters:
+        return None
+
+    year = _year(parsed)
+    operator = count_filters[-1][1]
+    threshold = count_filters[-1][2]
+    condition = f"n_products {operator} {float(threshold)}"
+    sql = (
+        "SELECT country,continent,year,n_products,export_value "
+        f"FROM market_year WHERE year={year} AND {condition} "
+        "ORDER BY n_products DESC,country ASC"
+    )
+    columns, rows, _ = execute_sql(sql, max_rows=100)
+    threshold_text = f"{threshold:,.0f}"
+    relation = {
+        ">": "more than",
+        ">=": "at least",
+        "<": "fewer than",
+        "<=": "at most",
+        "=": "exactly",
+    }.get(operator, operator)
+
+    if not rows:
+        _, maximum_rows, _ = execute_sql(
+            "SELECT country,n_products,export_value FROM market_year "
+            f"WHERE year={year} ORDER BY n_products DESC LIMIT 1",
+            max_rows=1,
+        )
+        if maximum_rows:
+            top = maximum_rows[0]
+            answer = (
+                f"No destination country received {relation} {threshold_text} distinct Lebanese products in {year}. "
+                f"The highest count was {int(top.get('n_products') or 0):,} products in {top.get('country')}."
+            )
+        else:
+            answer = f"No matching destination record is available for {year}."
+        return QueryPlan(
+            f"Countries receiving {relation} {threshold_text} Lebanese products in {year}",
+            kind="direct",
+            direct_answer=answer,
+            entities={"year": year, "metric": "n_products", "group": "market"},
+            confidence=1.0,
+        )
+
+    return QueryPlan(
+        f"Countries receiving {relation} {threshold_text} Lebanese products in {year}",
+        sql,
+        entities={"year": year, "metric": "n_products", "group": "market"},
+        confidence=1.0,
+    )
+
+
+def _unresolved_product_plan(parsed: ParsedQuestion) -> QueryPlan | None:
+    """Prevent unsupported product substitutions when no exact product resolved."""
+    if parsed.products:
+        return None
+    phrase = _extract_unresolved_product_phrase(parsed.original)
+    if not phrase:
+        return None
+    if parsed.group in {"market", "sector", "continent", "year"} and re.search(
+        r"\b(?:products|goods|items|commodities)\b", parsed.norm
+    ):
+        return None
+    direct = (
+        f"I could not find an exact dashboard product matching **{phrase}**. "
+        "I did not substitute a different product, so no export value was returned."
+    )
+    return QueryPlan(
+        "Product not found in the dashboard",
+        kind="direct",
+        direct_answer=direct,
+        entities={"metric": "product_lookup", "unresolved_product": phrase},
+        confidence=1.0,
+    )
+
+
 def _global_count_plan(parsed: ParsedQuestion) -> QueryPlan | None:
     if parsed.operation != "count" or parsed.products or parsed.markets or parsed.sectors:
         return None
@@ -1440,8 +2399,10 @@ def _global_count_plan(parsed: ParsedQuestion) -> QueryPlan | None:
 
 def build_plan(parsed: ParsedQuestion) -> QueryPlan | None:
     for builder in (
-        _definition_plan, _coverage_plan, _global_count_plan, _entry_exit_plan, _drivers_plan, _set_relation_plan,
-        _pair_plan, _sector_market_plan, _continent_plan, _product_plan, _market_plan, _sector_plan, _average_plan,
+        _definition_plan, _coverage_plan, _market_product_count_threshold_plan,
+        _unresolved_product_plan, _global_count_plan, _entry_exit_plan, _drivers_plan, _set_relation_plan,
+        _pair_plan, _sector_market_plan, _continent_plan, _product_profile_plan,
+        _product_plan, _market_plan, _sector_plan, _average_plan,
         _performance_plan, _ranking_plan, _total_plan,
     ):
         plan = builder(parsed)
@@ -1589,6 +2550,33 @@ def _summarize_series(rows: list[dict[str, Any]], value_col: str) -> str | None:
     return f"{_label(value_col)} {direction} from {_format_value(a, value_col)} in {int(first['year'])} to {_format_value(b, value_col)} in {int(last['year'])} ({change:+.1f}%)."
 
 
+def _filter_visible_columns(columns: list[str], question: str) -> list[str]:
+    q = _norm_text(question)
+    requested = _parse_measures(q)
+    destination_ranking = bool(re.search(r"\b(?:top|main|largest|leading|best)\s+(?:markets|countries|destinations)\b|\bwhere\b", q))
+    product_share_question = bool(re.search(r"share of .{0,80}(?:product|exports).{0,40}(?:went|go|going|to)", q))
+    hidden_by_default = {
+        "rca": "rca" not in requested,
+        "pci": not ({"pci", "complexity"} & requested),
+        "pci_avg": not ({"pci", "complexity"} & requested),
+        "hhi": "hhi" not in requested,
+        "expy": "expy" not in requested,
+        "unrealized_potential_usd": "potential" not in requested,
+        "status": "performance" not in requested,
+        "priority": "performance" not in requested,
+        "cagr": not ({"cagr", "growth"} & requested),
+        "growth": "growth" not in requested,
+        "trajectory": "growth" not in requested,
+        "share_of_market_exports": destination_ranking or product_share_question,
+    }
+    result = []
+    for col in columns:
+        if hidden_by_default.get(col.lower(), False):
+            continue
+        result.append(col)
+    return result
+
+
 def deterministic_answer(plan: QueryPlan, columns: list[str], rows: list[dict[str, Any]], truncated: bool, question: str) -> str:
     if plan.kind == "direct":
         return f"**{plan.title}**\n\n{plan.direct_answer}"
@@ -1602,7 +2590,12 @@ def deterministic_answer(plan: QueryPlan, columns: list[str], rows: list[dict[st
 
     show_codes = _user_wants_code(question)
     visible = [c for c in columns if show_codes or c.lower() not in {"hs6", "hs4", "code"}]
+    visible = _filter_visible_columns(visible, question)
     lines = [f"**{plan.title}**", ""]
+    if plan.notes:
+        for note in plan.notes:
+            lines.append(f"- {note}")
+        lines.append("")
     if plan.direct_answer:
         lines.extend([plan.direct_answer, ""])
 
@@ -1625,7 +2618,28 @@ def deterministic_answer(plan: QueryPlan, columns: list[str], rows: list[dict[st
         return "\n".join(lines).strip()
 
     lead = _lead_column(visible)
+    if len(rows) > 1 and "year" in visible and len({row.get("year") for row in rows}) > 1:
+        lead = "year"
+    elif len(rows) > 1 and lead in {"product_name", "name"} and "country" in visible:
+        product_values = {str(row.get(lead)) for row in rows if row.get(lead) is not None}
+        country_values = {str(row.get("country")) for row in rows if row.get("country") is not None}
+        if len(product_values) == 1 and len(country_values) > 1:
+            lead = "country"
     time_series = lead == "year"
+    constant_cols = {
+        col for col in visible
+        if col != lead and col in {"product_name", "name", "country", "sector", "continent"}
+        and len({str(row.get(col)) for row in rows if row.get(col) is not None}) == 1
+    }
+    if len(rows) == 2 and value_col and lead in {"country", "sector", "product_name", "name"}:
+        try:
+            first_label, second_label = str(rows[0].get(lead)), str(rows[1].get(lead))
+            first_value, second_value = float(rows[0].get(value_col) or 0), float(rows[1].get(value_col) or 0)
+            gap = abs(first_value - second_value)
+            higher = first_label if first_value >= second_value else second_label
+            lines.extend([f"- **Comparison:** {higher} is higher by {_format_value(gap, value_col)}.", ""])
+        except Exception:
+            pass
     for idx, row in enumerate(rows, 1):
         lead_value = row.get(lead) if lead else None
         if lead == "year" and lead_value is not None:
@@ -1635,13 +2649,13 @@ def deterministic_answer(plan: QueryPlan, columns: list[str], rows: list[dict[st
         used = {lead} if lead else set()
         parts: list[str] = []
         for col in visible:
-            if col in used or row.get(col) is None:
+            if col in used or col in constant_cols or row.get(col) is None:
                 continue
             parts.append(f"{_label(col)}: {_format_value(row[col], col)}")
         prefix = "- " if time_series else f"{idx}. "
         line = f"{prefix}**{lead_value}**"
         if parts:
-            line += " — " + "; ".join(parts[:9])
+            line += " - " + "; ".join(parts[:9])
         lines.append(line)
     if truncated:
         lines.extend(["", "- The display is limited to the first 100 matching records."])
@@ -1761,10 +2775,39 @@ def _semantic_record_search(parsed: ParsedQuestion) -> QueryPlan | None:
     return QueryPlan("Matching dashboard records", sql, confidence=0.72, entities={"metric": "raw_records"})
 
 
+
+def _looks_like_concept_explanation(question: str) -> bool:
+    q = re.sub(r"\s+", " ", str(question or "").strip().lower())
+    concepts = (
+        "scale", "diversification", "diversified", "diversify", "composition",
+        "concentration", "complexity", "competitiveness", "comparative advantage",
+        "sophistication", "growth", "reach", "market size", "potential",
+        "performance", "priority", "hhi", "pci", "rca", "expy", "cagr",
+    )
+    explanation = (
+        "what is", "what are", "what does", "what do", "define", "definition",
+        "meaning", "explain", "tell me about", "help me understand", "how is",
+        "how are", "how do", "how should", "how to read", "interpret",
+        "difference between", "different from", "is higher", "is lower",
+        "is more", "is less", "always better", "good or bad", "why is",
+        "why are", "why does", "versus", " vs ",
+    )
+    return any(term in q for term in concepts) and (
+        any(term in q for term in explanation) or len(q.split()) <= 6
+    )
+
+
 def query_dashboard_sql(question: str, provider: str, model: str) -> DashboardAnswer:
     question = str(question or "").strip()
     if not question or not (DB_PLAIN_PATH.is_file() or DB_GZIP_PATH.is_file()):
         return DashboardAnswer(False, 0.0, "", "", {})
+
+    # Concept and interpretation questions should never be forced into a SQL
+    # ranking or aggregation. Use the dashboard glossary first.
+    if _looks_like_concept_explanation(question):
+        concept = query_dashboard(question)
+        if concept.matched and concept.entities.get("metric") == "concept_explanation":
+            return concept
 
     parsed = parse_question(question)
 
